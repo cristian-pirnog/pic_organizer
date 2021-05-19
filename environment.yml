@@ -1,0 +1,9 @@
+name: pic_organizer
+dependencies:
+  - python=3.8.8
+  - pillow=8.2.0
+  - black=19.10b0
+  - python-dateutil
+  - pip
+  - pip:
+    - tinytag

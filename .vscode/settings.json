@@ -1,0 +1,7 @@
+{
+    "python.formatting.provider": "black",
+    "terminal.integrated.env.linux": {
+        "PYTHONPATH": "${workspaceFolder}/src",
+    },
+    "python.pythonPath": "/var/services/homes/crpi/anaconda3/envs/pic_organizer/bin/python",
+}
