@@ -1,10 +1,10 @@
 import hashlib
 from datetime import datetime
-from dateutil.parser import parse
+from os import times
 from pathlib import Path
 from PIL import Image, ExifTags
 from typing import Union
-from shutil import copyfile, move as move_file, copy2 as copy_file
+from shutil import move as move_file, copy2 as copy_file
 
 def load_dict(backup_dir: Path) -> dict:
     result = {}
@@ -29,14 +29,16 @@ def process_directory(backup_dir: Path):
 
     dropbox_dir = backup_dir / "media_dropbox"
     print(f"Processing directory: {dropbox_dir}")
+    counts = {'moved': 0, 'removed': 0}
     for file in dropbox_dir.glob("**/*"):
         if '@eaDir' in str(file):
             continue
-        process_file(file, backup_dict, backup_dir)
+        process_file(file, backup_dict, backup_dir, counts)
     save_dict(backup_dir, backup_dict)
+    print(f'Counts:\n{counts}')
 
 
-def process_file(file: Path, backup_dict: dict, backup_dir: Path) -> bool:
+def process_file(file: Path, backup_dict: dict, backup_dir: Path, counts: dict):
     """Processes the given file"""
     print(f"Processing file: {file}...    ", end="")
 
@@ -65,6 +67,7 @@ def process_file(file: Path, backup_dict: dict, backup_dir: Path) -> bool:
             print(
                 f"\n\tChecksum found in backup_dict: {existing_target_file}. Removing file."
             )
+            counts['removed'] += 1
         try:
             file.unlink()
         except Exception:
@@ -74,8 +77,10 @@ def process_file(file: Path, backup_dict: dict, backup_dir: Path) -> bool:
     else:
         try:
             target_file = processors[extension](file, backup_dir)
+            print(f'\n\tMoving to file {target_file}')
             move_file(file, target_file)
             backup_dict[checksum] = target_file
+            counts['moved'] += 1
         except Exception as e:
             print(f'Got exception: {e}')
             pass
@@ -83,19 +88,28 @@ def process_file(file: Path, backup_dict: dict, backup_dir: Path) -> bool:
 
 def process_image(file: Path, base_target_dir: Path) -> Path:
     tag_info = get_tag_info(file)
+    if tag_info is None:
+        tag_info = get_creation_date(file)
+
     fields = ["DateTime", "DateTimeOriginal", "DateTimeDigitized"]
     for key in fields:
         if key not in tag_info:
             continue
-        timestamp = datetime.strftime(parse(tag_info[key]), "%Y%m%d-%H%M%S")
+        return get_target_file_name(base_target_dir, datetime.strptime(tag_info[key], r'%Y:%m:%d %H:%M:%S'))
+
+    raise RuntimeError(f'Could not find any of the fields {fields} in the tag info: {tag_info}')
+
+
+def get_target_file_name(base_target_dir: Path, timestamp: datetime):
         suffix = ""
         counter = 1
-        target_dir = base_target_dir / 'photos' / timestamp[:4]
+        target_dir = base_target_dir / 'photos' / str(timestamp.year) / f'{timestamp.month:02d}'
         target_dir.mkdir(parents=True, exist_ok=True)
 
         got_it = False
-        for _ in range(50):
-            target_file_name = target_dir / (f"IMG_{timestamp}{suffix}.JPG")
+        timestamp_str = datetime.strftime(timestamp, "%Y%m%d-%H%M%S")
+        for _ in range(1000):
+            target_file_name = target_dir / (f"IMG_{timestamp_str}{suffix}.JPG")
             if target_file_name.is_file():
                 suffix = f"_{counter:02d}"
                 counter += 1
@@ -107,14 +121,12 @@ def process_image(file: Path, base_target_dir: Path) -> Path:
             raise RuntimeError(f'Could not find a target file name after 50 tries: last tried was {target_file_name}')
         return target_file_name
 
-    raise RuntimeError(f'Could not find any of the fields {fields} in the tag info: {tag_info}')
-
 
 def process_video(file: Path, base_target_dir: Path) -> Path:
     raise RuntimeError(f'Function process_video not implemented')
 
 
-def get_tag_info(file: Path) -> dict:
+def get_tag_info(file: Path) -> Union[dict, None]:
     try:
         exif = Image.open(file)._getexif()
     except:
@@ -123,8 +135,16 @@ def get_tag_info(file: Path) -> dict:
 
     if exif is None:
         print(f"Image {file} has no EXIF information. Skipping it")
-        return {}
+        return None
 
     ts_tags = (36867, 36868, 306, 50971)
     return {ExifTags.TAGS[t]: exif[t] for t in ts_tags if t in exif}
 
+
+def get_creation_date(file: Path) -> dict:
+    file_stat = file.stat()
+    return {"DateTime": datetime.strftime(
+        datetime.fromtimestamp(
+        min(file_stat.st_ctime, 
+            file_stat.st_atime, 
+            file_stat.st_mtime)), "%Y%m%d-%H%M%S")}
