@@ -44,6 +44,7 @@ def process_file(file: Path, backup_dict: dict, backup_dir: Path, counts: dict):
 
     processors = {
         ".JPG": process_image,
+        ".JPEG": process_image,
         ".AVI": process_video,
         ".MOV": process_video,
         ".MP4": process_video,
