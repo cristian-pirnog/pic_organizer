@@ -3,6 +3,7 @@ from datetime import datetime
 from os import times
 from pathlib import Path
 from PIL import Image, ExifTags
+import re
 from typing import Union
 from shutil import move as move_file, copy2 as copy_file
 
@@ -96,7 +97,24 @@ def process_image(file: Path, base_target_dir: Path) -> Path:
     for key in fields:
         if key not in tag_info:
             continue
-        return get_target_file_name(base_target_dir, datetime.strptime(tag_info[key], r'%Y:%m:%d %H:%M:%S'))
+
+        ts = None
+        for dt_format in [r'%Y:%m:%d %H:%M:%S',
+                          r'%Y%m%d-%H%M%S',]:
+            try:
+                ts = datetime.strptime(tag_info[key], dt_format)
+                break
+            except:
+                pass
+        if ts is None:
+            raise RuntimeError(f'Could not parse date time: {tag_info[key]}')
+        return get_target_file_name(base_target_dir, ts)
+
+    # Try to guess the timestamp from the file name
+    if re.match(r'IMG_\d{8}-\d{6}.JPG', file.name) is not None:
+        print(f'\n\tThe file name matches the date-time pattern: {file.name}')
+        return get_target_file_name(base_target_dir, 
+            datetime.strptime(file.name.replace('IMG_', '').replace('.JPG', ''), r'%Y%m%d-%H%M%S'))
 
     raise RuntimeError(f'Could not find any of the fields {fields} in the tag info: {tag_info}')
 
