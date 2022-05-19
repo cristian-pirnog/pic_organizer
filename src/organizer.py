@@ -35,7 +35,8 @@ def process_directory(backup_dir: Path):
         if '@eaDir' in str(file):
             continue
         process_file(file, backup_dict, backup_dir, counts)
-    save_dict(backup_dir, backup_dict)
+    if counts['moved'] or counts['removed']:
+        save_dict(backup_dir, backup_dict)
     print(f'Counts:\n{counts}')
 
 
