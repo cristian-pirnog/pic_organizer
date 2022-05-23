@@ -1,11 +1,13 @@
+from ast import ExtSlice
 import hashlib
 from datetime import datetime
 from os import times
 from pathlib import Path
 from PIL import Image, ExifTags
 import re
-from typing import Union
+from typing import List, Union
 from shutil import move as move_file, copy2 as copy_file
+import subprocess
 
 def load_dict(backup_dir: Path) -> dict:
     result = {}
@@ -95,55 +97,45 @@ def process_image(file: Path, base_target_dir: Path) -> Path:
         tag_info = get_creation_date(file)
 
     fields = ["DateTime", "DateTimeOriginal", "DateTimeDigitized"]
+    img_prefix = 'IMG'
+    base_target_dir = base_target_dir / 'photos'
     for key in fields:
         if key not in tag_info:
             continue
-
-        ts = None
-        for dt_format in [r'%Y:%m:%d %H:%M:%S',
-                          r'%Y%m%d-%H%M%S',]:
-            try:
-                ts = datetime.strptime(tag_info[key], dt_format)
-                break
-            except:
-                pass
-        if ts is None:
-            raise RuntimeError(f'Could not parse date time: {tag_info[key]}')
-        return get_target_file_name(base_target_dir, ts)
+        ts = _parse_time(tag_info[key])
+        return get_target_file_name(base_target_dir, ts, img_prefix, '.JPG')
 
     # Try to guess the timestamp from the file name
-    if re.match(r'IMG_\d{8}-\d{6}.JPG', file.name) is not None:
+    if re.match(img_prefix + r'_\d{8}-\d{6}.JPG', file.name) is not None:
         print(f'\n\tThe file name matches the date-time pattern: {file.name}')
         return get_target_file_name(base_target_dir, 
-            datetime.strptime(file.name.replace('IMG_', '').replace('.JPG', ''), r'%Y%m%d-%H%M%S'))
+            datetime.strptime(file.name.replace(f'{img_prefix}_', '').replace('.JPG', ''), r'%Y%m%d-%H%M%S'))
 
     raise RuntimeError(f'Could not find any of the fields {fields} in the tag info: {tag_info}')
 
 
-def get_target_file_name(base_target_dir: Path, timestamp: datetime):
-        suffix = ""
-        counter = 1
-        target_dir = base_target_dir / 'photos' / str(timestamp.year) / f'{timestamp.month:02d}'
-        target_dir.mkdir(parents=True, exist_ok=True)
-
-        got_it = False
-        timestamp_str = datetime.strftime(timestamp, "%Y%m%d-%H%M%S")
-        for _ in range(1000):
-            target_file_name = target_dir / (f"IMG_{timestamp_str}{suffix}.JPG")
-            if target_file_name.is_file():
-                suffix = f"_{counter:02d}"
-                counter += 1
-                continue
-            got_it = True
-            break
-
-        if not got_it:
-            raise RuntimeError(f'Could not find a target file name after 50 tries: last tried was {target_file_name}')
-        return target_file_name
-
-
 def process_video(file: Path, base_target_dir: Path) -> Path:
-    raise RuntimeError(f'Function process_video not implemented')
+    ffprobe = '/var/packages/MediaServer/target/bin/ffprobe'
+    command = f'{ffprobe} -show_format -v quiet -select_streams v:0  -show_entries stream_tags=creation_time -of default=noprint_wrappers=1:nokey=1 {file}'
+    result = _run_command(command)
+    creation_time = _parse_time(result.stdout[:19])
+    return get_target_file_name(base_target_dir / 'videos', creation_time, 'VID', file.suffix.upper())
+
+
+def _parse_time(time_string: str) -> datetime:
+    ts = None
+    for dt_format in [r'%Y:%m:%d %H:%M:%S',
+                      r'%Y%m%d-%H%M%S',
+                      r'%Y-%m-%dT%H:%M:%S',]:
+        try:
+            ts = datetime.strptime(time_string, dt_format)
+            break
+        except:
+            pass
+    
+    if ts is None:
+        raise RuntimeError(f'Could not parse date time: {time_string}')
+    return ts
 
 
 def get_tag_info(file: Path) -> Union[dict, None]:
@@ -161,6 +153,30 @@ def get_tag_info(file: Path) -> Union[dict, None]:
     return {ExifTags.TAGS[t]: exif[t] for t in ts_tags if t in exif}
 
 
+def get_target_file_name(base_target_dir: Path, timestamp: datetime, prefix: str, extension: str):
+        suffix = ""
+        counter = 1
+        target_dir = base_target_dir / str(timestamp.year) / f'{timestamp.month:02d}'
+        target_dir.mkdir(parents=True, exist_ok=True)
+        if not extension.startswith('.'):
+            extension = f'.{extension}'
+
+        got_it = False
+        timestamp_str = datetime.strftime(timestamp, "%Y%m%d-%H%M%S")
+        for _ in range(1000):
+            target_file_name = target_dir / (f"{prefix}_{timestamp_str}{suffix}{extension}")
+            if target_file_name.is_file():
+                suffix = f"_{counter:02d}"
+                counter += 1
+                continue
+            got_it = True
+            break
+
+        if not got_it:
+            raise RuntimeError(f'Could not find a target file name after 50 tries: last tried was {target_file_name}')
+        return target_file_name
+
+
 def get_creation_date(file: Path) -> dict:
     file_stat = file.stat()
     return {"DateTime": datetime.strftime(
@@ -168,3 +184,48 @@ def get_creation_date(file: Path) -> dict:
         min(file_stat.st_ctime, 
             file_stat.st_atime, 
             file_stat.st_mtime)), "%Y%m%d-%H%M%S")}
+
+
+def _run_command(
+    command: Union[str, List[str]],
+    command_purpose: str = None,
+    exit_on_error: bool = True,
+    **kwargs,
+):
+    """Runs the command, checks for success and returns the result, with the stdout and stderr converted to str"""
+
+    if command_purpose is None:
+        command_purpose = command
+
+    if isinstance(command, list):
+        command_list = command
+        command = " ".join(command_list)
+    else:
+        command_list = [
+            x for x in command.split(" ") if len(x) != 0
+        ]  # handling multiple spaces
+
+    result = subprocess.run(
+        command_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs
+    )
+    if result.returncode != 0 and exit_on_error:
+        raise RuntimeError(
+            f'Failed to run command: "{command_purpose}".\n'
+            f"\tCommand {command}\n"
+            f"\tStdout: {result.stdout}\n"
+            f"\tStderr: {result.stderr}"
+        )
+
+    def _decode(bytes_: bytes) -> str:
+        result_ = bytes_.decode("utf-8")
+        if result_.startswith("'"):
+            result_ = result_[1:]
+        if result_.endswith("'"):
+            result_ = result_[:-1]
+        if result_.endswith("\n"):
+            result_ = result_[:-1]
+        return result_
+
+    result.stdout = _decode(result.stdout)
+    result.stderr = _decode(result.stderr)
+    return result
