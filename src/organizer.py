@@ -26,25 +26,25 @@ def save_dict(backup_dir: Path, backup_dict: dict):
     
 
 
-def process_directory(backup_dir: Path):
+def process_directory(backup_dir: Path, dry_run: bool):
     backup_dict = load_dict(backup_dir)
     print(f"Loaded {len(backup_dict)} checksums")
 
     dropbox_dir = backup_dir / "media_dropbox"
-    print(f"Processing directory: {dropbox_dir}")
+    print(f"\nProcessing directory: {dropbox_dir}")
     counts = {'moved': 0, 'removed': 0}
     for file in dropbox_dir.glob("**/*"):
         if '@eaDir' in str(file):
             continue
-        process_file(file, backup_dict, backup_dir, counts)
+        process_file(file, backup_dict, backup_dir, counts, dry_run)
     if counts['moved'] or counts['removed']:
         save_dict(backup_dir, backup_dict)
     print(f'Counts:\n{counts}')
 
 
-def process_file(file: Path, backup_dict: dict, backup_dir: Path, counts: dict):
+def process_file(file: Path, backup_dict: dict, backup_dir: Path, counts: dict, dry_run: bool):
     """Processes the given file"""
-    print(f"Processing file: {file}...    ", end="")
+    print(f"\nProcessing file: {file}")
 
     processors = {
         ".JPG": process_image,
@@ -74,7 +74,10 @@ def process_file(file: Path, backup_dict: dict, backup_dir: Path, counts: dict):
             )
             counts['removed'] += 1
         try:
-            file.unlink()
+            if not dry_run:
+                file.unlink()
+            else:
+                print(f"\tDry run: file not removed")
         except Exception:
             print(f"\tCould not remove the file: {file}")
             pass
@@ -83,33 +86,39 @@ def process_file(file: Path, backup_dict: dict, backup_dir: Path, counts: dict):
         try:
             target_file = processors[extension](file, backup_dir)
             print(f'\n\tMoving to file {target_file}')
-            move_file(file, target_file)
-            backup_dict[checksum] = target_file
-            counts['moved'] += 1
+            if dry_run:
+                print(f"\tDry run: file not moved")
+            else:
+                move_file(file, target_file)
+                backup_dict[checksum] = target_file
+                counts['moved'] += 1
         except Exception as e:
             print(f'Got exception: {e}')
             pass
-    print('Done')
 
 def process_image(file: Path, base_target_dir: Path) -> Path:
     tag_info = get_tag_info(file)
     if tag_info is None:
         tag_info = get_creation_date(file)
 
-    fields = ["DateTime", "DateTimeOriginal", "DateTimeDigitized"]
+    fields = ["DateTimeOriginal", "DateTimeDigitized"]
     img_prefix = 'IMG'
+    target_extension = ".JPG"
     base_target_dir = base_target_dir / 'photos'
     for key in fields:
         if key not in tag_info:
             continue
+        print(f"\tUsing timestamp from {key}")
         ts = _parse_time(tag_info[key])
-        return get_target_file_name(base_target_dir, ts, img_prefix, '.JPG')
+        return get_target_file_name(base_target_dir, ts, img_prefix, target_extension)
 
     # Try to guess the timestamp from the file name
-    if re.match(img_prefix + r'_\d{8}-\d{6}.JPG', file.name) is not None:
-        print(f'\n\tThe file name matches the date-time pattern: {file.name}')
+    print(f"\tTrying to guess timestamp from the file name")
+    if re.match(img_prefix + r'_\d{8}-\d{6}', file.name) is not None:
+        print(f'\tThe file name matches the date-time pattern: {file.name}')
         return get_target_file_name(base_target_dir, 
-            datetime.strptime(file.name.replace(f'{img_prefix}_', '').replace('.JPG', ''), r'%Y%m%d-%H%M%S'))
+            datetime.strptime(file.stem.replace(f'{img_prefix}_', ''), r'%Y%m%d-%H%M%S'), 
+            img_prefix, target_extension)
 
     raise RuntimeError(f'Could not find any of the fields {fields} in the tag info: {tag_info}')
 
@@ -146,7 +155,7 @@ def get_tag_info(file: Path) -> Union[dict, None]:
         return {}
 
     if exif is None:
-        print(f"Image {file} has no EXIF information. Skipping it")
+        print(f"\tImage {file} has no EXIF information. Skipping it")
         return None
 
     ts_tags = (36867, 36868, 306, 50971)
