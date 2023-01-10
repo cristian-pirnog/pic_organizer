@@ -5,26 +5,46 @@ from os import times
 from pathlib import Path
 from PIL import Image, ExifTags
 import re
-from typing import List, Union
+from typing import List, Union, Optional
 from shutil import move as move_file, copy2 as copy_file
+import shlex
 import subprocess
 
 def load_dict(backup_dir: Path) -> dict:
     result = {}
     with (backup_dir / "checksums").open("r") as fr:
         for line in fr:
-            k, v = line.split()
-            result[k] = v
+            k, v = line.split(maxsplit=1)
+            result[k] = v.rstrip()
     return result
 
-def save_dict(backup_dir: Path, backup_dict: dict):
-    checksum_file = (backup_dir / "checksums")
-    copy_file(checksum_file, Path(str(checksum_file) + '.bkp'))
+def save_dict(backup_dir: Path, backup_dict: dict, suffix: Optional[str] = ""):
+    checksum_file = (backup_dir / f"checksums{suffix}")
+    try:
+        copy_file(checksum_file, Path(str(checksum_file) + '.bkp'))
+    except:
+        pass
     with checksum_file.open("w") as fw:
         for k, v in backup_dict.items():
             fw.write(f'{k} {v}\n')
     
-
+def refresh_checksums(backup_dir: Path, dry_run: bool):
+    target_dirs = [backup_dir / "photos", backup_dir / "videos"]
+    new_backup_dict = {}
+    for t in target_dirs:
+        for file in sorted(t.glob("**/*")):
+            if not file.is_file():
+                print(f"Skipping directory ${file}")
+                continue
+            
+            print(f"Processing file {file}")
+            checksum = get_checksum(file)
+            new_backup_dict[checksum] = str(file)
+    
+    print(f"New checksum_dict has {len(new_backup_dict)} entries")
+    suffix = "_new" if dry_run else ""
+    save_dict(backup_dir, new_backup_dict, suffix)
+    
 
 def process_directory(backup_dir: Path, dry_run: bool):
     backup_dict = load_dict(backup_dir)
@@ -37,9 +57,26 @@ def process_directory(backup_dir: Path, dry_run: bool):
         if '@eaDir' in str(file):
             continue
         process_file(file, backup_dict, backup_dir, counts, dry_run)
-    if counts['moved'] or counts['removed']:
+    if not dry_run and counts['moved'] or counts['removed']:
         save_dict(backup_dir, backup_dict)
     print(f'Counts:\n{counts}')
+
+
+def get_checksum(file: Path):
+    # print(f"\tCalculating MD5 checksum")
+    m = hashlib.md5()
+    count = 0
+    with file.open("rb" ) as f:
+        while True:
+            # We calculate only for the first 100 MB or so
+            if count > 3:
+                break
+            count += 1
+            buf = f.read(2**25)  # 33MB chunks
+            if not buf:
+                break
+            m.update( buf )
+    return m.hexdigest()
 
 
 def process_file(file: Path, backup_dict: dict, backup_dir: Path, counts: dict, dry_run: bool):
@@ -49,6 +86,7 @@ def process_file(file: Path, backup_dict: dict, backup_dir: Path, counts: dict, 
     processors = {
         ".JPG": process_image,
         ".JPEG": process_image,
+        ".PNG": process_image,
         ".AVI": process_video,
         ".MOV": process_video,
         ".MP4": process_video,
@@ -64,7 +102,7 @@ def process_file(file: Path, backup_dict: dict, backup_dir: Path, counts: dict, 
     if not file.is_file():
         print(f"Not a file. Skipping")
         return
-    checksum = hashlib.md5(file.open("rb").read()).hexdigest()
+    checksum = get_checksum(file)
 
     existing_target_file = backup_dict.get(checksum, None)
     if existing_target_file is not None:
@@ -85,7 +123,7 @@ def process_file(file: Path, backup_dict: dict, backup_dir: Path, counts: dict, 
     else:
         try:
             target_file = processors[extension](file, backup_dir)
-            print(f'\n\tMoving to file {target_file}')
+            print(f'\tMoving to file {target_file}')
             if dry_run:
                 print(f"\tDry run: file not moved")
             else:
@@ -98,44 +136,47 @@ def process_file(file: Path, backup_dict: dict, backup_dir: Path, counts: dict, 
 
 def process_image(file: Path, base_target_dir: Path) -> Path:
     tag_info = get_tag_info(file)
-    if tag_info is None:
-        tag_info = get_creation_date(file)
-
     fields = ["DateTimeOriginal", "DateTimeDigitized"]
     img_prefix = 'IMG'
     target_extension = ".JPG"
     base_target_dir = base_target_dir / 'photos'
+    ts = None
     for key in fields:
         if key not in tag_info:
             continue
         print(f"\tUsing timestamp from {key}")
-        ts = _parse_time(tag_info[key])
-        return get_target_file_name(base_target_dir, ts, img_prefix, target_extension)
+        ts = tag_info[key]
 
-    # Try to guess the timestamp from the file name
-    print(f"\tTrying to guess timestamp from the file name")
-    if re.match(img_prefix + r'_\d{8}-\d{6}', file.name) is not None:
-        print(f'\tThe file name matches the date-time pattern: {file.name}')
-        return get_target_file_name(base_target_dir, 
-            datetime.strptime(file.stem.replace(f'{img_prefix}_', ''), r'%Y%m%d-%H%M%S'), 
-            img_prefix, target_extension)
-
-    raise RuntimeError(f'Could not find any of the fields {fields} in the tag info: {tag_info}')
-
+    # If no timestamp found in the EXIF data try to guess it from the file name
+    if ts is None:
+        print(f"\tFailed to get creation time from metadata. Trying file name.")
+        ts = get_creation_date_from_file_name(file, r'\d{8}-\d{6}')
+    
+    if ts is None:
+        raise RuntimeError(f'Could not find any of the fields {fields} in the tag info: {tag_info}')
+    
+    timestamp = _parse_time(ts)
+    timestamp_str = datetime.strftime(timestamp, "%Y%m%d-%H%M%S")
+    return get_target_file_name(base_target_dir, timestamp, f"{img_prefix}_{timestamp_str}", target_extension)
+    
 
 def process_video(file: Path, base_target_dir: Path) -> Path:
-    ffprobe = '/var/packages/MediaServer/target/bin/ffprobe'
-    command = f'{ffprobe} -show_format -v quiet -select_streams v:0  -show_entries stream_tags=creation_time -of default=noprint_wrappers=1:nokey=1 {file}'
-    result = _run_command(command)
-    creation_time = _parse_time(result.stdout[:19])
-    return get_target_file_name(base_target_dir / 'videos', creation_time, 'VID', file.suffix.upper())
+    """For videos we only get the creation time from the file name"""
+    creation_time = get_creation_date_from_file_name(file, '\d{4}-\d{2}-\d{2}')
+    print(f"New checksum_dict has {len(new_backup_dict)} entries")
+    suffix = "_new" if dry_run else ""
+    if creation_time is None:
+        raise RuntimeError(f'Could not find the creation timestamp.')
+    
+    return get_target_file_name(base_target_dir / 'videos', _parse_time(creation_time), file.stem, file.suffix.upper())
 
 
 def _parse_time(time_string: str) -> datetime:
     ts = None
     for dt_format in [r'%Y:%m:%d %H:%M:%S',
                       r'%Y%m%d-%H%M%S',
-                      r'%Y-%m-%dT%H:%M:%S',]:
+                      r'%Y-%m-%dT%H:%M:%S',
+                      r'%Y-%m-%d',]:
         try:
             ts = datetime.strptime(time_string, dt_format)
             break
@@ -147,7 +188,7 @@ def _parse_time(time_string: str) -> datetime:
     return ts
 
 
-def get_tag_info(file: Path) -> Union[dict, None]:
+def get_tag_info(file: Path) -> dict:
     try:
         exif = Image.open(file)._getexif()
     except:
@@ -156,13 +197,13 @@ def get_tag_info(file: Path) -> Union[dict, None]:
 
     if exif is None:
         print(f"\tImage {file} has no EXIF information. Skipping it")
-        return None
+        return {}
 
     ts_tags = (36867, 36868, 306, 50971)
     return {ExifTags.TAGS[t]: exif[t] for t in ts_tags if t in exif}
 
 
-def get_target_file_name(base_target_dir: Path, timestamp: datetime, prefix: str, extension: str):
+def get_target_file_name(base_target_dir: Path, timestamp: datetime, file_stem: str, extension: str):
         suffix = ""
         counter = 1
         target_dir = base_target_dir / str(timestamp.year) / f'{timestamp.month:02d}'
@@ -171,9 +212,8 @@ def get_target_file_name(base_target_dir: Path, timestamp: datetime, prefix: str
             extension = f'.{extension}'
 
         got_it = False
-        timestamp_str = datetime.strftime(timestamp, "%Y%m%d-%H%M%S")
         for _ in range(1000):
-            target_file_name = target_dir / (f"{prefix}_{timestamp_str}{suffix}{extension}")
+            target_file_name = target_dir / f"{file_stem}{suffix}{extension}"
             if target_file_name.is_file():
                 suffix = f"_{counter:02d}"
                 counter += 1
@@ -186,13 +226,12 @@ def get_target_file_name(base_target_dir: Path, timestamp: datetime, prefix: str
         return target_file_name
 
 
-def get_creation_date(file: Path) -> dict:
-    file_stat = file.stat()
-    return {"DateTime": datetime.strftime(
-        datetime.fromtimestamp(
-        min(file_stat.st_ctime, 
-            file_stat.st_atime, 
-            file_stat.st_mtime)), "%Y%m%d-%H%M%S")}
+def get_creation_date_from_file_name(file: Path, match_pattern: str) -> dict:
+    print(f"\tTrying to guess timestamp from the file name")
+    match_object = re.search(match_pattern, file.name)
+    print(f"\t\tGuessed timestamp: {match_object.group(0)}.")
+    return match_object.group(0) if match_object else None
+    
 
 
 def _run_command(
@@ -211,7 +250,7 @@ def _run_command(
         command = " ".join(command_list)
     else:
         command_list = [
-            x for x in command.split(" ") if len(x) != 0
+            x for x in shlex.split(command) if len(x) != 0
         ]  # handling multiple spaces
 
     result = subprocess.run(
@@ -238,3 +277,4 @@ def _run_command(
     result.stdout = _decode(result.stdout)
     result.stderr = _decode(result.stderr)
     return result
+    

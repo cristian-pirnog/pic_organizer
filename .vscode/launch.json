@@ -10,7 +10,7 @@
             "request": "launch",
             "program": "main.py",
             "console": "integratedTerminal",
-            "args": ["/volume1/backup"]
+            "args": ["organize", "/volume1/backup", "--dry-run"]
         }
     ]
 }
